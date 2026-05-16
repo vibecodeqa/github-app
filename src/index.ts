@@ -57,9 +57,11 @@ export default {
 				response = Response.json({ error: "not found" }, { status: 404 });
 			}
 
-			// Add CORS headers to all responses
-			for (const [k, v] of Object.entries(corsHeaders)) {
-				response.headers.set(k, v);
+			// Add CORS headers (skip redirects — their headers are immutable)
+			if (response.status < 300 || response.status >= 400) {
+				for (const [k, v] of Object.entries(corsHeaders)) {
+					response.headers.set(k, v);
+				}
 			}
 			return response;
 		} catch (err) {
