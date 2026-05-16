@@ -1,0 +1,83 @@
+# .github/workflows/vibecodeqa.yml — Add this to any repo to get VibeCode QA on every PR
+name: VibeCode QA
+on:
+  pull_request:
+    branches: [main, master]
+
+permissions:
+  contents: read
+  security-events: write  # for SARIF upload
+  pull-requests: write    # for PR comments
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run VibeCode QA
+        run: npx @vibecodeqa/cli --skip-tests --ci --sarif --json > .vibe-check/results.json 2>/dev/null || true
+
+      - name: Upload SARIF to GitHub Security
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: .vibe-check/report.sarif
+        continue-on-error: true
+
+      - name: Post PR comment
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            try {
+              const report = JSON.parse(fs.readFileSync('.vibe-check/report.json', 'utf-8'));
+              const grade = report.grade;
+              const score = report.score;
+              const issues = report.checks.reduce((s, c) => s + c.issues.length, 0);
+              const checks = report.checks
+                .filter(c => !c.details?.skipped && !c.details?.comingSoon)
+                .sort((a, b) => a.score - b.score)
+                .slice(0, 5)
+                .map(c => `| ${c.name} | ${c.grade} ${c.score} | ${c.issues.length} |`)
+                .join('\n');
+
+              const body = [
+                `## VibeCode QA — **${grade} ${score}/100**`,
+                '',
+                `${report.checks.filter(c => !c.details?.skipped).length} checks · ${issues} issues`,
+                '',
+                '| Check | Score | Issues |',
+                '|-------|-------|--------|',
+                checks,
+                '',
+                `[Full report](https://vibecodeqa.online) · \`npx @vibecodeqa/cli\``,
+              ].join('\n');
+
+              // Find existing comment to update
+              const { data: comments } = await github.rest.issues.listComments({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+              });
+              const existing = comments.find(c => c.body?.includes('VibeCode QA'));
+
+              if (existing) {
+                await github.rest.issues.updateComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  comment_id: existing.id,
+                  body,
+                });
+              } else {
+                await github.rest.issues.createComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: context.issue.number,
+                  body,
+                });
+              }
+            } catch (e) {
+              console.log('Could not post PR comment:', e.message);
+            }

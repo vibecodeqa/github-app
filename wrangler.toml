@@ -1,0 +1,13 @@
+name = "vibecodeqa-github-app"
+main = "src/index.ts"
+compatibility_date = "2025-05-01"
+
+[vars]
+APP_URL = "https://app.vibecodeqa.online"
+
+# Secrets (set via `wrangler secret put`):
+# GITHUB_APP_ID
+# GITHUB_APP_PRIVATE_KEY
+# GITHUB_WEBHOOK_SECRET
+# GITHUB_CLIENT_ID
+# GITHUB_CLIENT_SECRET
