@@ -5,6 +5,10 @@ compatibility_date = "2025-05-01"
 [vars]
 APP_URL = "https://app.vibecodeqa.online"
 
+[[kv_namespaces]]
+binding = "REPORTS"
+id = "placeholder_create_via_wrangler"
+
 # Secrets (set via `wrangler secret put`):
 # GITHUB_APP_ID
 # GITHUB_APP_PRIVATE_KEY

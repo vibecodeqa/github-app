@@ -19,6 +19,7 @@ export interface Env {
 	GITHUB_CLIENT_ID: string;
 	GITHUB_CLIENT_SECRET: string;
 	APP_URL: string;
+	REPORTS: KVNamespace;
 }
 
 export default {
@@ -46,8 +47,12 @@ export default {
 				response = await handleAuth(request, env, url);
 			} else if (path === "/api/repos" && request.method === "GET") {
 				response = await handleRepos(request, env);
+			} else if (path === "/api/reports" && request.method === "POST") {
+				response = await handleReportUpload(request, env);
+			} else if (path.startsWith("/api/reports/") && request.method === "GET") {
+				response = await handleReportList(request, env, path);
 			} else if (path === "/health") {
-				response = Response.json({ ok: true, version: "0.1.0" });
+				response = Response.json({ ok: true, version: "0.2.0" });
 			} else {
 				response = Response.json({ error: "not found" }, { status: 404 });
 			}
@@ -63,6 +68,87 @@ export default {
 		}
 	},
 };
+
+// ── Report upload: POST /api/reports ──
+// Body: { repo: "owner/name", report: <VibeReport JSON> }
+// Stores in KV keyed by repo + timestamp. Keeps last 30 per repo.
+
+async function handleReportUpload(request: Request, env: Env): Promise<Response> {
+	const auth = request.headers.get("Authorization");
+	if (!auth?.startsWith("Bearer ")) {
+		return Response.json({ error: "unauthorized" }, { status: 401 });
+	}
+
+	const body = (await request.json()) as { repo?: string; report?: Record<string, unknown> };
+	if (!body.repo || !body.report) {
+		return Response.json({ error: "missing repo or report" }, { status: 400 });
+	}
+
+	const repo = body.repo;
+	const report = body.report as { score?: number; grade?: string; timestamp?: string; checks?: unknown[] };
+	const ts = report.timestamp || new Date().toISOString();
+	const key = `report:${repo}:${ts}`;
+
+	// Store the full report
+	await env.REPORTS.put(key, JSON.stringify(report), { expirationTtl: 86400 * 365 }); // 1 year
+
+	// Update the index (list of timestamps for this repo)
+	const indexKey = `index:${repo}`;
+	const existingIndex = await env.REPORTS.get(indexKey);
+	const timestamps: string[] = existingIndex ? JSON.parse(existingIndex) : [];
+	timestamps.push(ts);
+	// Keep last 100
+	const trimmed = timestamps.slice(-100);
+	await env.REPORTS.put(indexKey, JSON.stringify(trimmed));
+
+	return Response.json({
+		ok: true,
+		repo,
+		score: report.score,
+		grade: report.grade,
+		timestamp: ts,
+		totalReports: trimmed.length,
+	});
+}
+
+// ── Report list: GET /api/reports/:owner/:repo ──
+// Returns summary of last N reports for trend display.
+
+async function handleReportList(request: Request, env: Env, path: string): Promise<Response> {
+	const auth = request.headers.get("Authorization");
+	if (!auth?.startsWith("Bearer ")) {
+		return Response.json({ error: "unauthorized" }, { status: 401 });
+	}
+
+	// path = /api/reports/owner/repo
+	const parts = path.replace("/api/reports/", "").split("/");
+	if (parts.length < 2) {
+		return Response.json({ error: "invalid repo path" }, { status: 400 });
+	}
+	const repo = `${parts[0]}/${parts[1]}`;
+
+	const indexKey = `index:${repo}`;
+	const existingIndex = await env.REPORTS.get(indexKey);
+	if (!existingIndex) {
+		return Response.json({ repo, reports: [] });
+	}
+
+	const timestamps: string[] = JSON.parse(existingIndex);
+	const last30 = timestamps.slice(-30);
+
+	// Fetch summaries (score + grade + timestamp + issue count)
+	const summaries = await Promise.all(
+		last30.map(async (ts) => {
+			const data = await env.REPORTS.get(`report:${repo}:${ts}`);
+			if (!data) return null;
+			const r = JSON.parse(data) as { score: number; grade: string; timestamp: string; checks?: { issues: unknown[] }[] };
+			const issues = r.checks?.reduce((s: number, c) => s + (c.issues?.length || 0), 0) || 0;
+			return { score: r.score, grade: r.grade, timestamp: r.timestamp, issues };
+		}),
+	);
+
+	return Response.json({ repo, reports: summaries.filter(Boolean) });
+}
 
 async function handleRepos(request: Request, env: Env): Promise<Response> {
 	const auth = request.headers.get("Authorization");
