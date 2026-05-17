@@ -2,15 +2,23 @@
  * VibeCode QA GitHub App — Cloudflare Worker
  *
  * Routes:
- *   POST /webhook         — GitHub webhook events (push, pull_request)
- *   GET  /auth/login      — Start GitHub OAuth flow
- *   GET  /auth/callback    — OAuth callback → exchange code for token
- *   GET  /api/repos        — List user's repos with installation status
- *   GET  /health           — Health check
+ *   POST /webhook                          — GitHub webhook events (push, pull_request)
+ *   GET  /auth/login                       — Start GitHub OAuth flow
+ *   GET  /auth/callback                    — OAuth callback → exchange code for token
+ *   GET  /api/repos                        — List user's repos with installation status
+ *   GET  /api/orgs                         — List user's GitHub orgs
+ *   GET  /api/orgs/:org/repos              — List org repos with latest scores
+ *   GET  /api/repos/:owner/:repo/settings  — Get per-repo config
+ *   PUT  /api/repos/:owner/:repo/settings  — Save per-repo config
+ *   POST /api/repos/:owner/:repo/scan      — Trigger manual scan
+ *   POST /api/notifications/test           — Send test notification
+ *   GET  /health                           — Health check
  */
 
 import { handleAuth } from "./auth.js";
-import { handleWebhook } from "./webhook.js";
+import { createAppJWT, getInstallationToken } from "./github.js";
+import { handleWebhook, postQualityGateStatus } from "./webhook.js";
+import { getRepoSettings, sendNotifications, defaultSettings } from "./settings.js";
 
 export interface Env {
 	GITHUB_APP_ID: string;
@@ -22,6 +30,12 @@ export interface Env {
 	REPORTS: KVNamespace;
 }
 
+export interface RepoSettings {
+	triggers: { onPr: boolean; onPush: boolean; scheduled: string | null };
+	qualityGate: { enabled: boolean; minScore: number };
+	notifications: { type: "slack" | "discord"; url: string; onRegression: boolean; onScanComplete: boolean }[];
+}
+
 export default {
 	async fetch(request: Request, env: Env): Promise<Response> {
 		const url = new URL(request.url);
@@ -30,7 +44,7 @@ export default {
 		// CORS for app.vibecodeqa.online
 		const corsHeaders = {
 			"Access-Control-Allow-Origin": env.APP_URL,
-			"Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+			"Access-Control-Allow-Methods": "GET, POST, PUT, OPTIONS",
 			"Access-Control-Allow-Headers": "Content-Type, Authorization",
 		};
 
@@ -47,6 +61,18 @@ export default {
 				response = await handleAuth(request, env, url);
 			} else if (path === "/api/repos" && request.method === "GET") {
 				response = await handleRepos(request, env);
+			} else if (path === "/api/orgs" && request.method === "GET") {
+				response = await handleOrgs(request);
+			} else if (path.match(/^\/api\/orgs\/[^/]+\/repos$/) && request.method === "GET") {
+				response = await handleOrgRepos(request, env, path);
+			} else if (path.match(/^\/api\/repos\/[^/]+\/[^/]+\/settings$/) && request.method === "GET") {
+				response = await handleGetRepoSettings(request, env, path);
+			} else if (path.match(/^\/api\/repos\/[^/]+\/[^/]+\/settings$/) && request.method === "PUT") {
+				response = await handlePutRepoSettings(request, env, path);
+			} else if (path.match(/^\/api\/repos\/[^/]+\/[^/]+\/scan$/) && request.method === "POST") {
+				response = await handleManualScan(request, env, path);
+			} else if (path === "/api/notifications/test" && request.method === "POST") {
+				response = await handleTestNotification(request);
 			} else if (path === "/api/reports" && request.method === "POST") {
 				response = await handleReportUpload(request, env);
 			} else if (path.startsWith("/api/reports/") && path.endsWith("/full") && request.method === "GET") {
@@ -54,7 +80,7 @@ export default {
 			} else if (path.startsWith("/api/reports/") && request.method === "GET") {
 				response = await handleReportList(request, env, path);
 			} else if (path === "/health") {
-				response = Response.json({ ok: true, version: "0.2.0" });
+				response = Response.json({ ok: true, version: "0.3.0" });
 			} else {
 				response = Response.json({ error: "not found" }, { status: 404 });
 			}
@@ -71,11 +97,31 @@ export default {
 			return Response.json({ error: "internal error" }, { status: 500, headers: corsHeaders });
 		}
 	},
+
+	async scheduled(_event: ScheduledEvent, env: Env): Promise<void> {
+		// Iterate repos with scheduled scans and trigger workflows
+		const listed = await env.REPORTS.list({ prefix: "repo-settings:" });
+		for (const key of listed.keys) {
+			try {
+				const raw = await env.REPORTS.get(key.name);
+				if (!raw) continue;
+				const settings: RepoSettings = JSON.parse(raw);
+				if (!settings.triggers.scheduled) continue;
+
+				const repo = key.name.slice("repo-settings:".length);
+				const [owner] = repo.split("/");
+				await triggerWorkflowDispatch(owner, repo, env);
+			} catch {
+				// Skip malformed entries
+			}
+		}
+	},
 };
 
 // ── Report upload: POST /api/reports ──
-// Body: { repo: "owner/name", report: <VibeReport JSON> }
-// Stores in KV keyed by repo + timestamp. Keeps last 30 per repo.
+// Body: { repo: "owner/name", report: <VibeReport JSON>, sha?: string }
+// Stores in KV keyed by repo + timestamp. Keeps last 100 per repo.
+// Fires quality gate + regression notifications.
 
 async function handleReportUpload(request: Request, env: Env): Promise<Response> {
 	const auth = request.headers.get("Authorization");
@@ -83,7 +129,7 @@ async function handleReportUpload(request: Request, env: Env): Promise<Response>
 		return Response.json({ error: "unauthorized" }, { status: 401 });
 	}
 
-	const body = (await request.json()) as { repo?: string; report?: Record<string, unknown> };
+	const body = (await request.json()) as { repo?: string; report?: Record<string, unknown>; sha?: string };
 	if (!body.repo || !body.report) {
 		return Response.json({ error: "missing repo or report" }, { status: 400 });
 	}
@@ -100,10 +146,38 @@ async function handleReportUpload(request: Request, env: Env): Promise<Response>
 	const indexKey = `index:${repo}`;
 	const existingIndex = await env.REPORTS.get(indexKey);
 	const timestamps: string[] = existingIndex ? JSON.parse(existingIndex) : [];
-	timestamps.push(ts);
-	// Keep last 100
+
+	// Check for regression (compare to previous)
+	const settings = await getRepoSettings(repo, env);
+	if (timestamps.length > 0 && report.score != null) {
+		const prevTs = timestamps[timestamps.length - 1];
+		const prevData = await env.REPORTS.get(`report:${repo}:${prevTs}`);
+		if (prevData) {
+			const prev = JSON.parse(prevData) as { score?: number; grade?: string };
+			const drop = (prev.score ?? 0) - (report.score ?? 0);
+			if (drop >= 5) {
+				await sendNotifications(
+					repo, settings, "regression",
+					`*VibeCode QA* | ${repo} score dropped ${drop} pts (${prev.score} → ${report.score})`,
+				);
+			}
+		}
+	}
+
+	// Notify on scan complete
+	await sendNotifications(
+		repo, settings, "scan_complete",
+		`*VibeCode QA* | ${repo} scan complete — score: ${report.score}, grade: ${report.grade}`,
+	);
+
+	if (!timestamps.includes(ts)) timestamps.push(ts);
 	const trimmed = timestamps.slice(-100);
 	await env.REPORTS.put(indexKey, JSON.stringify(trimmed));
+
+	// Quality gate — post commit status if SHA provided
+	if (body.sha && report.score != null) {
+		await postQualityGateStatus(repo, body.sha, report.score, env).catch(() => {});
+	}
 
 	return Response.json({
 		ok: true,
@@ -143,11 +217,15 @@ async function handleReportList(request: Request, env: Env, path: string): Promi
 	// Fetch summaries (score + grade + timestamp + issue count)
 	const summaries = await Promise.all(
 		last30.map(async (ts) => {
-			const data = await env.REPORTS.get(`report:${repo}:${ts}`);
-			if (!data) return null;
-			const r = JSON.parse(data) as { score: number; grade: string; timestamp: string; checks?: { issues: unknown[] }[] };
-			const issues = r.checks?.reduce((s: number, c) => s + (c.issues?.length || 0), 0) || 0;
-			return { score: r.score, grade: r.grade, timestamp: r.timestamp, issues };
+			try {
+				const data = await env.REPORTS.get(`report:${repo}:${ts}`);
+				if (!data) return null;
+				const r = JSON.parse(data) as { score: number; grade: string; timestamp: string; checks?: { issues: unknown[] }[] };
+				const issues = r.checks?.reduce((s: number, c) => s + (c.issues?.length || 0), 0) || 0;
+				return { score: r.score, grade: r.grade, timestamp: r.timestamp, issues };
+			} catch {
+				return null;
+			}
 		}),
 	);
 
@@ -188,6 +266,222 @@ async function handleReportFull(request: Request, env: Env, path: string): Promi
 		headers: { "Content-Type": "application/json" },
 	});
 }
+
+// ── GitHub helpers ──
+
+function getToken(request: Request): string | null {
+	const auth = request.headers.get("Authorization");
+	if (!auth?.startsWith("Bearer ")) return null;
+	return auth.slice(7);
+}
+
+function ghHeaders(token: string) {
+	return {
+		Authorization: `Bearer ${token}`,
+		"User-Agent": "VibeCodeQA-App",
+		Accept: "application/vnd.github+json",
+	};
+}
+
+function extractRepo(path: string, prefix: string, suffix = ""): string | null {
+	// Remove exact prefix and suffix using slice (not replace, to avoid partial matches)
+	let stripped = path;
+	if (stripped.startsWith(prefix)) stripped = stripped.slice(prefix.length);
+	if (suffix && stripped.endsWith(suffix)) stripped = stripped.slice(0, -suffix.length);
+	const parts = stripped.split("/");
+	if (parts.length < 2) return null;
+	return `${parts[0]}/${parts[1]}`;
+}
+
+// ── GET /api/orgs — list user's GitHub orgs ──
+
+async function handleOrgs(request: Request): Promise<Response> {
+	const token = getToken(request);
+	if (!token) return Response.json({ error: "unauthorized" }, { status: 401 });
+
+	const res = await fetch("https://api.github.com/user/orgs?per_page=100", {
+		headers: ghHeaders(token),
+	});
+	if (!res.ok) return Response.json({ error: "github api error" }, { status: res.status });
+
+	const orgs = (await res.json()) as Array<{ login: string; avatar_url: string; description: string | null }>;
+	return Response.json(orgs.map((o) => ({ login: o.login, avatar_url: o.avatar_url, description: o.description })));
+}
+
+// ── GET /api/orgs/:org/repos — list org repos with latest scores ──
+
+async function handleOrgRepos(request: Request, env: Env, path: string): Promise<Response> {
+	const token = getToken(request);
+	if (!token) return Response.json({ error: "unauthorized" }, { status: 401 });
+
+	const org = path.slice("/api/orgs/".length, path.lastIndexOf("/repos"));
+
+	const res = await fetch(`https://api.github.com/orgs/${org}/repos?per_page=100&sort=updated`, {
+		headers: ghHeaders(token),
+	});
+	if (!res.ok) return Response.json({ error: "github api error" }, { status: res.status });
+
+	const repos = (await res.json()) as Array<{
+		full_name: string; name: string; private: boolean; language: string | null; updated_at: string;
+	}>;
+
+	// Enrich with latest scores from KV
+	const enriched = await Promise.all(
+		repos.map(async (r) => {
+			let latestScore: number | null = null;
+			let latestGrade: string | null = null;
+			try {
+				const indexKey = `index:${r.full_name}`;
+				const idx = await env.REPORTS.get(indexKey);
+				if (idx) {
+					const timestamps: string[] = JSON.parse(idx);
+					if (timestamps.length > 0) {
+						const latest = timestamps[timestamps.length - 1];
+						const data = await env.REPORTS.get(`report:${r.full_name}:${latest}`);
+						if (data) {
+							const parsed = JSON.parse(data) as { score?: number; grade?: string };
+							latestScore = parsed.score ?? null;
+							latestGrade = parsed.grade ?? null;
+						}
+				}
+			}
+			} catch { /* corrupt KV data */ }
+			return {
+				fullName: r.full_name,
+				name: r.name,
+				private: r.private,
+				language: r.language,
+				updatedAt: r.updated_at,
+				latestScore,
+				latestGrade,
+			};
+		}),
+	);
+
+	return Response.json(enriched);
+}
+
+// ── GET /api/repos/:owner/:repo/settings ──
+
+async function handleGetRepoSettings(request: Request, env: Env, path: string): Promise<Response> {
+	const token = getToken(request);
+	if (!token) return Response.json({ error: "unauthorized" }, { status: 401 });
+
+	const repo = extractRepo(path, "/api/repos/", "/settings");
+	if (!repo) return Response.json({ error: "invalid path" }, { status: 400 });
+
+	// Verify user has write access
+	const permRes = await fetch(`https://api.github.com/repos/${repo}`, { headers: ghHeaders(token) });
+	if (!permRes.ok) return Response.json({ error: "repo not found or no access" }, { status: 403 });
+	const repoData = (await permRes.json()) as { permissions?: { push?: boolean } };
+	if (!repoData.permissions?.push) return Response.json({ error: "write access required" }, { status: 403 });
+
+	const raw = await env.REPORTS.get(`repo-settings:${repo}`);
+	const settings: RepoSettings = raw ? JSON.parse(raw) : defaultSettings();
+
+	return Response.json(settings);
+}
+
+// ── PUT /api/repos/:owner/:repo/settings ──
+
+async function handlePutRepoSettings(request: Request, env: Env, path: string): Promise<Response> {
+	const token = getToken(request);
+	if (!token) return Response.json({ error: "unauthorized" }, { status: 401 });
+
+	const repo = extractRepo(path, "/api/repos/", "/settings");
+	if (!repo) return Response.json({ error: "invalid path" }, { status: 400 });
+
+	// Verify write access
+	const permRes = await fetch(`https://api.github.com/repos/${repo}`, { headers: ghHeaders(token) });
+	if (!permRes.ok) return Response.json({ error: "repo not found or no access" }, { status: 403 });
+	const repoData = (await permRes.json()) as { permissions?: { push?: boolean } };
+	if (!repoData.permissions?.push) return Response.json({ error: "write access required" }, { status: 403 });
+
+	const body = (await request.json()) as RepoSettings;
+	await env.REPORTS.put(`repo-settings:${repo}`, JSON.stringify(body));
+
+	return Response.json({ ok: true });
+}
+
+// ── POST /api/repos/:owner/:repo/scan — trigger manual scan ──
+
+async function handleManualScan(request: Request, env: Env, path: string): Promise<Response> {
+	const token = getToken(request);
+	if (!token) return Response.json({ error: "unauthorized" }, { status: 401 });
+
+	const repo = extractRepo(path, "/api/repos/", "/scan");
+	if (!repo) return Response.json({ error: "invalid path" }, { status: 400 });
+
+	// Trigger workflow_dispatch via user token
+	const res = await fetch(`https://api.github.com/repos/${repo}/actions/workflows/vibecodeqa.yml/dispatches`, {
+		method: "POST",
+		headers: { ...ghHeaders(token), "Content-Type": "application/json" },
+		body: JSON.stringify({ ref: "main" }),
+	});
+
+	if (!res.ok) {
+		const text = await res.text();
+		return Response.json({ error: "failed to trigger scan", details: text }, { status: res.status });
+	}
+
+	return Response.json({ ok: true, action: "workflow_dispatched" });
+}
+
+// ── POST /api/notifications/test — send test notification ──
+
+async function handleTestNotification(request: Request): Promise<Response> {
+	const token = getToken(request);
+	if (!token) return Response.json({ error: "unauthorized" }, { status: 401 });
+
+	const body = (await request.json()) as { type: "slack" | "discord"; url: string };
+	if (!body.url) return Response.json({ error: "missing webhook url" }, { status: 400 });
+
+	const message = body.type === "discord"
+		? { content: "**VibeCode QA** - Test notification. Your webhook is working!" }
+		: { text: "*VibeCode QA* - Test notification. Your webhook is working!" };
+
+	const res = await fetch(body.url, {
+		method: "POST",
+		headers: { "Content-Type": "application/json" },
+		body: JSON.stringify(message),
+	});
+
+	if (!res.ok) {
+		return Response.json({ error: "webhook failed", status: res.status }, { status: 400 });
+	}
+
+	return Response.json({ ok: true });
+}
+
+async function triggerWorkflowDispatch(owner: string, repo: string, env: Env): Promise<void> {
+	// Find installation ID for the owner
+	const jwt = await createAppJWT(env);
+	const res = await fetch(`https://api.github.com/orgs/${owner}/installation`, {
+		headers: {
+			Authorization: `Bearer ${jwt}`,
+			"User-Agent": "VibeCodeQA-App",
+			Accept: "application/vnd.github+json",
+		},
+	});
+	if (!res.ok) return;
+
+	const installation = (await res.json()) as { id: number };
+	const token = await getInstallationToken(installation.id, env);
+	if (!token) return;
+
+	await fetch(`https://api.github.com/repos/${repo}/actions/workflows/vibecodeqa.yml/dispatches`, {
+		method: "POST",
+		headers: {
+			Authorization: `Bearer ${token}`,
+			"User-Agent": "VibeCodeQA-App",
+			Accept: "application/vnd.github+json",
+			"Content-Type": "application/json",
+		},
+		body: JSON.stringify({ ref: "main" }),
+	}).catch(() => {});
+}
+
+// ── Existing handlers ──
 
 async function handleRepos(request: Request, env: Env): Promise<Response> {
 	const auth = request.headers.get("Authorization");

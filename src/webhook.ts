@@ -2,24 +2,24 @@
  * GitHub webhook handler — receives push and pull_request events.
  *
  * On pull_request (opened/synchronize):
- *   1. Check out the PR head
+ *   1. Check repo settings for trigger config
  *   2. Post a "scanning..." comment
- *   3. Run analysis (via the report JSON structure)
- *   4. Update comment with results
+ *   3. Trigger GH Actions workflow
+ *   4. Quality gate: post commit status based on score
  *
- * Since CF Workers can't run node/CLI directly, we:
- *   - Parse the repo files via GitHub API (tree endpoint)
- *   - Run a lightweight subset of checks in-worker
- *   - OR trigger a GitHub Actions workflow that runs the full CLI
- *
- * For v0.1, we use the "trigger GH Actions" approach — simpler and full-featured.
+ * On push (to default branch):
+ *   1. Check repo settings for onPush trigger
+ *   2. Trigger scan workflow
  */
 
 import type { Env } from "./index.js";
-import { getInstallationToken } from "./github.js";
+import { createAppJWT, getInstallationToken } from "./github.js";
+import { getRepoSettings } from "./settings.js";
 
 interface WebhookPayload {
 	action?: string;
+	ref?: string;
+	after?: string;
 	pull_request?: {
 		number: number;
 		head: { sha: string; ref: string };
@@ -29,6 +29,7 @@ interface WebhookPayload {
 		full_name: string;
 		owner: { login: string };
 		name: string;
+		default_branch?: string;
 	};
 	installation?: { id: number };
 }
@@ -46,8 +47,31 @@ export async function handleWebhook(request: Request, env: Env): Promise<Respons
 	const payload: WebhookPayload = JSON.parse(body);
 
 	if (event === "pull_request" && (payload.action === "opened" || payload.action === "synchronize")) {
+		const repo = payload.repository?.full_name;
+		if (repo) {
+			const settings = await getRepoSettings(repo, env);
+			if (!settings.triggers.onPr) {
+				return Response.json({ ok: true, action: "pr_trigger_disabled" });
+			}
+		}
 		await handlePullRequest(payload, env);
 		return Response.json({ ok: true, action: "pr_scan_triggered" });
+	}
+
+	if (event === "push" && payload.repository) {
+		const repo = payload.repository.full_name;
+		const defaultBranch = payload.repository.default_branch || "main";
+		const ref = payload.ref;
+
+		// Only act on pushes to the default branch
+		if (ref === `refs/heads/${defaultBranch}`) {
+			const settings = await getRepoSettings(repo, env);
+			if (settings.triggers.onPush) {
+				await handlePush(payload, env);
+				return Response.json({ ok: true, action: "push_scan_triggered" });
+			}
+		}
+		return Response.json({ ok: true, action: "push_ignored" });
 	}
 
 	// Acknowledge other events
@@ -115,6 +139,74 @@ async function handlePullRequest(payload: WebhookPayload, env: Env): Promise<voi
 			].join("\n"),
 		}),
 	});
+}
+
+async function handlePush(payload: WebhookPayload, env: Env): Promise<void> {
+	const repo = payload.repository!;
+	const installationId = payload.installation?.id;
+	if (!installationId) return;
+
+	const token = await getInstallationToken(installationId, env);
+	if (!token) return;
+
+	// Trigger the vibecodeqa workflow
+	await fetch(`https://api.github.com/repos/${repo.full_name}/actions/workflows/vibecodeqa.yml/dispatches`, {
+		method: "POST",
+		headers: {
+			Authorization: `Bearer ${token}`,
+			"User-Agent": "VibeCodeQA-App",
+			Accept: "application/vnd.github+json",
+			"Content-Type": "application/json",
+		},
+		body: JSON.stringify({ ref: payload.ref?.replace("refs/heads/", "") || "main" }),
+	}).catch(() => {});
+}
+
+/**
+ * Post a commit status (quality gate) for a given SHA.
+ * Called after a report is uploaded for a repo with quality gates enabled.
+ */
+export async function postQualityGateStatus(
+	repo: string,
+	sha: string,
+	score: number,
+	env: Env,
+): Promise<void> {
+	const settings = await getRepoSettings(repo, env);
+	if (!settings.qualityGate.enabled) return;
+
+	const passed = score >= settings.qualityGate.minScore;
+
+	// Need an installation token — find installation for the repo owner
+	const [owner] = repo.split("/");
+	const jwt = await createAppJWT(env);
+
+	const installRes = await fetch(`https://api.github.com/orgs/${owner}/installation`, {
+		headers: { Authorization: `Bearer ${jwt}`, "User-Agent": "VibeCodeQA-App", Accept: "application/vnd.github+json" },
+	});
+	if (!installRes.ok) return;
+
+	const installation = (await installRes.json()) as { id: number };
+	const token = await getInstallationToken(installation.id, env);
+	if (!token) return;
+
+	await fetch(`https://api.github.com/repos/${repo}/statuses/${sha}`, {
+		method: "POST",
+		headers: {
+			Authorization: `Bearer ${token}`,
+			"User-Agent": "VibeCodeQA-App",
+			Accept: "application/vnd.github+json",
+			"Content-Type": "application/json",
+		},
+		body: JSON.stringify({
+			state: passed ? "success" : "failure",
+			description: passed
+				? `Score ${score}/100 (min: ${settings.qualityGate.minScore})`
+				: `Score ${score}/100 — below minimum ${settings.qualityGate.minScore}`,
+			context: "VibeCode QA / Quality Gate",
+			target_url: "https://app.vibecodeqa.online",
+		}),
+	}).catch(() => {});
 }
 
 async function verifySignature(body: string, signature: string, secret: string): Promise<boolean> {

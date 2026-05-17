@@ -13,6 +13,9 @@ APP_URL = "https://app.vibecodeqa.online"
 binding = "REPORTS"
 id = "04bc9fc88b654e9e9b1994026eedf178"
 
+[triggers]
+crons = ["0 * * * *"]
+
 # Secrets (set via `wrangler secret put`):
 # GITHUB_APP_ID
 # GITHUB_APP_PRIVATE_KEY

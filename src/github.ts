@@ -5,7 +5,7 @@
 import type { Env } from "./index.js";
 
 /** Create a JWT for the GitHub App. */
-async function createAppJWT(env: Env): Promise<string> {
+export async function createAppJWT(env: Env): Promise<string> {
 	const now = Math.floor(Date.now() / 1000);
 	const header = { alg: "RS256", typ: "JWT" };
 	const payload = {
