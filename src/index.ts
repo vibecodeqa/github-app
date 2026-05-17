@@ -398,6 +398,21 @@ async function handlePutRepoSettings(request: Request, env: Env, path: string): 
 	if (!repoData.permissions?.push) return Response.json({ error: "write access required" }, { status: 403 });
 
 	const body = (await request.json()) as RepoSettings;
+
+	// Validate notification webhook URLs to prevent SSRF
+	const allowedHosts = ["hooks.slack.com", "discord.com", "discordapp.com"];
+	for (const n of body.notifications || []) {
+		if (!n.url) continue;
+		try {
+			const u = new URL(n.url);
+			if (u.protocol !== "https:" || !allowedHosts.some((h) => u.hostname === h || u.hostname.endsWith(`.${h}`))) {
+				return Response.json({ error: `invalid webhook URL: only Slack/Discord HTTPS webhooks allowed` }, { status: 400 });
+			}
+		} catch {
+			return Response.json({ error: "invalid webhook URL" }, { status: 400 });
+		}
+	}
+
 	await env.REPORTS.put(`repo-settings:${repo}`, JSON.stringify(body));
 
 	return Response.json({ ok: true });
@@ -435,6 +450,17 @@ async function handleTestNotification(request: Request): Promise<Response> {
 
 	const body = (await request.json()) as { type: "slack" | "discord"; url: string };
 	if (!body.url) return Response.json({ error: "missing webhook url" }, { status: 400 });
+
+	// Validate webhook URL — only allow known webhook domains to prevent SSRF
+	let parsed: URL;
+	try { parsed = new URL(body.url); } catch { return Response.json({ error: "invalid url" }, { status: 400 }); }
+	const allowedHosts = ["hooks.slack.com", "discord.com", "discordapp.com"];
+	if (!allowedHosts.some((h) => parsed.hostname === h || parsed.hostname.endsWith(`.${h}`))) {
+		return Response.json({ error: "only Slack and Discord webhook URLs are allowed" }, { status: 400 });
+	}
+	if (parsed.protocol !== "https:") {
+		return Response.json({ error: "webhook URL must use HTTPS" }, { status: 400 });
+	}
 
 	const message = body.type === "discord"
 		? { content: "**VibeCode QA** - Test notification. Your webhook is working!" }

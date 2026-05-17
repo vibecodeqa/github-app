@@ -214,5 +214,13 @@ async function verifySignature(body: string, signature: string, secret: string):
 	const key = await crypto.subtle.importKey("raw", encoder.encode(secret), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
 	const sig = await crypto.subtle.sign("HMAC", key, encoder.encode(body));
 	const expected = `sha256=${Array.from(new Uint8Array(sig)).map((b) => b.toString(16).padStart(2, "0")).join("")}`;
-	return signature === expected;
+	// Constant-time comparison to prevent timing attacks
+	if (signature.length !== expected.length) return false;
+	const a = encoder.encode(signature);
+	const b = encoder.encode(expected);
+	let result = 0;
+	for (let i = 0; i < a.length; i++) {
+		result |= a[i] ^ b[i];
+	}
+	return result === 0;
 }
