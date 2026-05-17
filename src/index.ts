@@ -49,6 +49,8 @@ export default {
 				response = await handleRepos(request, env);
 			} else if (path === "/api/reports" && request.method === "POST") {
 				response = await handleReportUpload(request, env);
+			} else if (path.startsWith("/api/reports/") && path.endsWith("/full") && request.method === "GET") {
+				response = await handleReportFull(request, env, path);
 			} else if (path.startsWith("/api/reports/") && request.method === "GET") {
 				response = await handleReportList(request, env, path);
 			} else if (path === "/health") {
@@ -150,6 +152,41 @@ async function handleReportList(request: Request, env: Env, path: string): Promi
 	);
 
 	return Response.json({ repo, reports: summaries.filter(Boolean) });
+}
+
+// ── Fetch full report: GET /api/reports/:owner/:repo/full ──
+// Returns the latest full report JSON for the interactive viewer.
+
+async function handleReportFull(request: Request, env: Env, path: string): Promise<Response> {
+	const auth = request.headers.get("Authorization");
+	if (!auth?.startsWith("Bearer ")) {
+		return Response.json({ error: "unauthorized" }, { status: 401 });
+	}
+
+	// path = /api/reports/owner/repo/full
+	const parts = path.replace("/api/reports/", "").replace("/full", "").split("/");
+	if (parts.length < 2) {
+		return Response.json({ error: "invalid repo path" }, { status: 400 });
+	}
+	const repo = `${parts[0]}/${parts[1]}`;
+
+	// Get index to find latest timestamp
+	const indexKey = `index:${repo}`;
+	const existingIndex = await env.REPORTS.get(indexKey);
+	if (!existingIndex) {
+		return Response.json({ error: "no reports found" }, { status: 404 });
+	}
+
+	const timestamps: string[] = JSON.parse(existingIndex);
+	const latest = timestamps[timestamps.length - 1];
+	const reportData = await env.REPORTS.get(`report:${repo}:${latest}`);
+	if (!reportData) {
+		return Response.json({ error: "report not found" }, { status: 404 });
+	}
+
+	return new Response(reportData, {
+		headers: { "Content-Type": "application/json" },
+	});
 }
 
 async function handleRepos(request: Request, env: Env): Promise<Response> {
