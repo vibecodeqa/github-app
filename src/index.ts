@@ -26,6 +26,7 @@ export interface Env {
 	GITHUB_WEBHOOK_SECRET: string;
 	GITHUB_CLIENT_ID: string;
 	GITHUB_CLIENT_SECRET: string;
+	ANTHROPIC_API_KEY: string;
 	APP_URL: string;
 	REPORTS: KVNamespace;
 }
@@ -73,6 +74,8 @@ export default {
 				response = await handleManualScan(request, env, path);
 			} else if (path === "/api/notifications/test" && request.method === "POST") {
 				response = await handleTestNotification(request);
+			} else if (path === "/api/pro/doc-coherence" && request.method === "POST") {
+				response = await handleProDocCoherence(request, env);
 			} else if (path === "/api/reports" && request.method === "POST") {
 				response = await handleReportUpload(request, env);
 			} else if (path.startsWith("/api/reports/") && path.endsWith("/full") && request.method === "GET") {
@@ -477,6 +480,63 @@ async function handleTestNotification(request: Request): Promise<Response> {
 	}
 
 	return Response.json({ ok: true });
+}
+
+// ── POST /api/pro/doc-coherence — LLM-powered doc analysis ──
+
+async function handleProDocCoherence(request: Request, env: Env): Promise<Response> {
+	const token = getToken(request);
+	if (!token) return Response.json({ error: "unauthorized" }, { status: 401 });
+	if (!env.ANTHROPIC_API_KEY) return Response.json({ error: "LLM not configured" }, { status: 503 });
+
+	const body = (await request.json()) as { readme?: string; exports?: { file: string; export: string }[]; docFiles?: string[] };
+	if (!body.readme && !body.exports?.length) {
+		return Response.json({ findings: [] });
+	}
+
+	// Build prompt for Claude
+	const exportList = (body.exports || []).slice(0, 30).map((e) => `${e.file}: ${e.export}`).join("\n");
+	const prompt = `You are a code quality auditor. Analyze this project's documentation vs its code exports for contradictions.
+
+README (first 4000 chars):
+${(body.readme || "").slice(0, 4000)}
+
+Exported symbols:
+${exportList}
+
+Doc files present: ${(body.docFiles || []).join(", ")}
+
+Find contradictions: features mentioned in docs but not in code, functions documented but not exported, claims that don't match reality. Return JSON array of findings:
+[{"severity":"warning","message":"README claims X but no export matches","file":"README.md"}]
+
+Only return real contradictions. If docs match code, return []. JSON only, no markdown.`;
+
+	try {
+		const res = await fetch("https://api.anthropic.com/v1/messages", {
+			method: "POST",
+			headers: {
+				"Content-Type": "application/json",
+				"x-api-key": env.ANTHROPIC_API_KEY,
+				"anthropic-version": "2023-06-01",
+			},
+			body: JSON.stringify({
+				model: "claude-haiku-4-5-20251001",
+				max_tokens: 1024,
+				messages: [{ role: "user", content: prompt }],
+			}),
+		});
+
+		if (!res.ok) {
+			return Response.json({ findings: [], error: "LLM request failed" });
+		}
+
+		const data = (await res.json()) as { content: { text: string }[] };
+		const text = data.content?.[0]?.text || "[]";
+		const findings = JSON.parse(text);
+		return Response.json({ findings: Array.isArray(findings) ? findings : [] });
+	} catch {
+		return Response.json({ findings: [] });
+	}
 }
 
 async function triggerWorkflowDispatch(owner: string, repo: string, env: Env): Promise<void> {
