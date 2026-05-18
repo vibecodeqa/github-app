@@ -104,41 +104,61 @@ async function handlePullRequest(payload: WebhookPayload, env: Env): Promise<voi
 	});
 	const comment = (await commentRes.json()) as { id: number };
 
-	// Trigger the check run via GitHub Actions
-	// The repo needs a .github/workflows/vibecodeqa.yml that runs the CLI
-	// For now, we post a summary directly by fetching the latest report if available
-	// TODO: implement full GH Actions dispatch or in-worker analysis
+	// Try to trigger the vibecodeqa workflow if it exists
+	const dispatchRes = await fetch(
+		`https://api.github.com/repos/${repo.full_name}/actions/workflows/vibecodeqa.yml/dispatches`,
+		{
+			method: "POST",
+			headers: { ...headers, "Content-Type": "application/json" },
+			body: JSON.stringify({ ref: pr.head.ref }),
+		},
+	);
 
-	// Update comment with instructions for now
-	await fetch(`https://api.github.com/repos/${repo.full_name}/issues/comments/${comment.id}`, {
-		method: "PATCH",
-		headers: { ...headers, "Content-Type": "application/json" },
-		body: JSON.stringify({
-			body: [
-				"## VibeCode QA",
-				"",
-				`Scanning PR #${pr.number} (\`${pr.head.ref}\` → \`${pr.base.ref}\`)...`,
-				"",
-				"Add this workflow to your repo to get full scan results:",
-				"```yaml",
-				"# .github/workflows/vibecodeqa.yml",
-				"name: VibeCode QA",
-				"on: [pull_request]",
-				"jobs:",
-				"  scan:",
-				"    runs-on: ubuntu-latest",
-				"    steps:",
-				"      - uses: actions/checkout@v4",
-				"      - run: npx @vibecodeqa/cli --ci --sarif",
-				"      - uses: github/codeql-action/upload-sarif@v3",
-				"        with:",
-				"          sarif_file: .vibe-check/report.sarif",
-				"```",
-				"",
-				"[View full setup guide](https://vibecodeqa.online)",
-			].join("\n"),
-		}),
-	});
+	if (dispatchRes.ok) {
+		// Workflow dispatched — update comment
+		await fetch(`https://api.github.com/repos/${repo.full_name}/issues/comments/${comment.id}`, {
+			method: "PATCH",
+			headers: { ...headers, "Content-Type": "application/json" },
+			body: JSON.stringify({
+				body: `## VibeCode QA\n\nScanning PR #${pr.number} (\`${pr.head.ref}\` \u2192 \`${pr.base.ref}\`)...\n\n\u23f3 Workflow triggered — results will appear when the scan completes.\n\n[View dashboard](https://app.vibecodeqa.online)`,
+			}),
+		});
+	} else {
+		// No workflow found — post setup instructions
+		await fetch(`https://api.github.com/repos/${repo.full_name}/issues/comments/${comment.id}`, {
+			method: "PATCH",
+			headers: { ...headers, "Content-Type": "application/json" },
+			body: JSON.stringify({
+				body: [
+					"## VibeCode QA",
+					"",
+					`PR #${pr.number} (\`${pr.head.ref}\` \u2192 \`${pr.base.ref}\`)`,
+					"",
+					"No workflow found. Add this to enable automatic PR scanning:",
+					"```yaml",
+					"# .github/workflows/vibecodeqa.yml",
+					"name: VibeCode QA",
+					"on: [pull_request]",
+					"permissions: { contents: read }",
+					"jobs:",
+					"  scan:",
+					"    runs-on: ubuntu-latest",
+					"    steps:",
+					"      - uses: actions/checkout@v4",
+					"      - run: npx @vibecodeqa/cli --ci --fail-under 70 --sarif --upload",
+					"        env:",
+					"          VCQA_TOKEN: ${{ secrets.VCQA_TOKEN }}",
+					"      - uses: github/codeql-action/upload-sarif@v3",
+					"        if: always()",
+					"        with:",
+					"          sarif_file: .vibe-check/report.sarif",
+					"```",
+					"",
+					"[Setup guide](https://vibecodeqa.online) | [Dashboard](https://app.vibecodeqa.online)",
+				].join("\n"),
+			}),
+		});
+	}
 }
 
 async function handlePush(payload: WebhookPayload, env: Env): Promise<void> {
