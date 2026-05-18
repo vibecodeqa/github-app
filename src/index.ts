@@ -493,23 +493,29 @@ async function handleProDocCoherence(request: Request, env: Env): Promise<Respon
 	if (!body.readme && !body.exports?.length) {
 		return Response.json({ findings: [] });
 	}
+	// Limit input size to prevent abuse
+	if ((body.readme?.length || 0) > 10_000) {
+		return Response.json({ error: "readme too large (max 10KB)" }, { status: 400 });
+	}
+	if ((body.exports?.length || 0) > 100) {
+		return Response.json({ error: "too many exports (max 100)" }, { status: 400 });
+	}
 
-	// Build prompt for Claude
+	// Build prompt for Claude — user content in XML tags to prevent injection
 	const exportList = (body.exports || []).slice(0, 30).map((e) => `${e.file}: ${e.export}`).join("\n");
-	const prompt = `You are a code quality auditor. Analyze this project's documentation vs its code exports for contradictions.
+	const prompt = `You are a code quality auditor. Analyze the documentation and code exports provided in the <user_content> tags below. Find contradictions: features mentioned in docs but not in code, functions documented but not exported, claims that don't match reality.
 
-README (first 4000 chars):
+Return a JSON array of findings. Each finding has: severity ("warning" or "info"), message (what's wrong), file (which doc file). If docs match code, return []. JSON array only, no markdown.
+
+<user_content>
+<readme>
 ${(body.readme || "").slice(0, 4000)}
-
-Exported symbols:
+</readme>
+<exports>
 ${exportList}
-
-Doc files present: ${(body.docFiles || []).join(", ")}
-
-Find contradictions: features mentioned in docs but not in code, functions documented but not exported, claims that don't match reality. Return JSON array of findings:
-[{"severity":"warning","message":"README claims X but no export matches","file":"README.md"}]
-
-Only return real contradictions. If docs match code, return []. JSON only, no markdown.`;
+</exports>
+<doc_files>${(body.docFiles || []).join(", ")}</doc_files>
+</user_content>`;
 
 	try {
 		const res = await fetch("https://api.anthropic.com/v1/messages", {
