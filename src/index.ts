@@ -13,6 +13,11 @@
  *   POST /api/repos/:owner/:repo/scan      — Trigger manual scan
  *   POST /api/notifications/test           — Send test notification
  *   GET  /health                           — Health check
+ *
+ * Integration API (API key auth):
+ *   GET  /api/v1/repos/:owner/:repo/latest — Latest scan summary
+ *   POST /api/v1/scan                      — Trigger scan for a repo
+ *   GET  /badge/:owner/:repo.svg           — Public badge SVG (no auth, cached)
  */
 
 import { handleAuth } from "./auth.js";
@@ -27,6 +32,7 @@ export interface Env {
 	GITHUB_CLIENT_ID: string;
 	GITHUB_CLIENT_SECRET: string;
 	ANTHROPIC_API_KEY: string;
+	PLATFORM_API_KEYS?: string; // comma-separated API keys for integration endpoints
 	APP_URL: string;
 	REPORTS: KVNamespace;
 }
@@ -42,9 +48,12 @@ export default {
 		const url = new URL(request.url);
 		const path = url.pathname;
 
-		// CORS for app.vibecodeqa.online
+		// CORS — allow dashboard + any platform integration origin
+		const origin = request.headers.get("Origin") || "";
+		const allowedOrigins = [env.APP_URL, "https://console.freeappstore.online", "https://freeappstore.online"];
+		const corsOrigin = allowedOrigins.includes(origin) ? origin : env.APP_URL;
 		const corsHeaders = {
-			"Access-Control-Allow-Origin": env.APP_URL,
+			"Access-Control-Allow-Origin": corsOrigin,
 			"Access-Control-Allow-Methods": "GET, POST, PUT, OPTIONS",
 			"Access-Control-Allow-Headers": "Content-Type, Authorization",
 		};
@@ -82,17 +91,28 @@ export default {
 				response = await handleReportFull(request, env, path);
 			} else if (path.startsWith("/api/reports/") && request.method === "GET") {
 				response = await handleReportList(request, env, path);
+			// ── Integration API (API key or public) ──
+			} else if (path.match(/^\/badge\/[^/]+\/[^/]+\.svg$/) && request.method === "GET") {
+				response = await handleBadge(env, path);
+			} else if (path.match(/^\/api\/v1\/repos\/[^/]+\/[^/]+\/latest$/) && request.method === "GET") {
+				response = await handleLatestReport(request, env, path);
+			} else if (path === "/api/v1/scan" && request.method === "POST") {
+				response = await handleScanTrigger(request, env);
 			} else if (path === "/health") {
-				response = Response.json({ ok: true, version: "0.3.0" });
+				response = Response.json({ ok: true, version: "0.4.0" });
 			} else {
 				response = Response.json({ error: "not found" }, { status: 404 });
 			}
 
-			// Add CORS headers (skip redirects — their headers are immutable)
-			if (response.status < 300 || response.status >= 400) {
+			// Add CORS headers (skip redirects and badge SVGs)
+			if ((response.status < 300 || response.status >= 400) && !path.startsWith("/badge/")) {
 				for (const [k, v] of Object.entries(corsHeaders)) {
 					response.headers.set(k, v);
 				}
+			}
+			// Badge SVGs: allow any origin
+			if (path.startsWith("/badge/")) {
+				response.headers.set("Access-Control-Allow-Origin", "*");
 			}
 			return response;
 		} catch (err) {
@@ -543,6 +563,190 @@ ${exportList}
 	} catch {
 		return Response.json({ findings: [] });
 	}
+}
+
+// ── Integration API handlers ──
+
+function verifyApiKey(request: Request, env: Env): boolean {
+	const auth = request.headers.get("Authorization");
+	if (!auth?.startsWith("Bearer ")) return false;
+	const key = auth.slice(7);
+	const keys = (env.PLATFORM_API_KEYS || "").split(",").map((k) => k.trim()).filter(Boolean);
+	return keys.includes(key);
+}
+
+/** GET /badge/:owner/:repo.svg — public badge SVG, cached 1 hour */
+async function handleBadge(env: Env, path: string): Promise<Response> {
+	// path = /badge/owner/repo.svg
+	const match = path.match(/^\/badge\/([^/]+)\/([^/]+)\.svg$/);
+	if (!match) return new Response("not found", { status: 404 });
+	const repo = `${match[1]}/${match[2]}`;
+
+	// Get latest score from KV
+	const indexKey = `index:${repo}`;
+	const idx = await env.REPORTS.get(indexKey);
+	let score = 0;
+	let grade = "?";
+	if (idx) {
+		const timestamps: string[] = JSON.parse(idx);
+		if (timestamps.length > 0) {
+			const latest = timestamps[timestamps.length - 1];
+			const data = await env.REPORTS.get(`report:${repo}:${latest}`);
+			if (data) {
+				const parsed = JSON.parse(data) as { score?: number; grade?: string };
+				score = parsed.score ?? 0;
+				grade = parsed.grade ?? "?";
+			}
+		}
+	}
+
+	const svg = buildBadgeSvg(score, grade);
+	return new Response(svg, {
+		headers: {
+			"Content-Type": "image/svg+xml",
+			"Cache-Control": "public, max-age=3600, s-maxage=3600",
+		},
+	});
+}
+
+/** GET /api/v1/repos/:owner/:repo/latest — latest scan summary (API key auth) */
+async function handleLatestReport(request: Request, env: Env, path: string): Promise<Response> {
+	if (!verifyApiKey(request, env)) {
+		return Response.json({ error: "invalid or missing API key" }, { status: 401 });
+	}
+
+	const repo = extractRepo(path, "/api/v1/repos/", "/latest");
+	if (!repo) return Response.json({ error: "invalid path" }, { status: 400 });
+
+	const indexKey = `index:${repo}`;
+	const idx = await env.REPORTS.get(indexKey);
+	if (!idx) {
+		return Response.json({ error: "no reports found", repo }, { status: 404 });
+	}
+
+	const timestamps: string[] = JSON.parse(idx);
+	if (timestamps.length === 0) {
+		return Response.json({ error: "no reports found", repo }, { status: 404 });
+	}
+
+	const latest = timestamps[timestamps.length - 1];
+	const data = await env.REPORTS.get(`report:${repo}:${latest}`);
+	if (!data) {
+		return Response.json({ error: "report data missing", repo }, { status: 404 });
+	}
+
+	const report = JSON.parse(data) as {
+		score?: number; grade?: string; timestamp?: string; version?: string;
+		checks?: { name: string; score: number; grade: string; issues: unknown[] }[];
+		meta?: { duration?: number };
+	};
+
+	const issuesTotal = report.checks?.reduce((s, c) => s + (c.issues?.length || 0), 0) || 0;
+	const checksPassed = report.checks?.filter((c) => c.score >= 75).length || 0;
+	const checksTotal = report.checks?.length || 0;
+
+	return Response.json({
+		score: report.score ?? 0,
+		grade: report.grade ?? "?",
+		issues_total: issuesTotal,
+		checks_passed: checksPassed,
+		checks_total: checksTotal,
+		timestamp: report.timestamp || latest,
+		report_url: `https://app.vibecodeqa.online/reports/${repo}`,
+		checks: report.checks?.map((c) => ({
+			name: c.name,
+			score: c.score,
+			grade: c.grade,
+			issues: c.issues?.length || 0,
+		})),
+	});
+}
+
+/** POST /api/v1/scan — trigger a scan (API key auth) */
+async function handleScanTrigger(request: Request, env: Env): Promise<Response> {
+	if (!verifyApiKey(request, env)) {
+		return Response.json({ error: "invalid or missing API key" }, { status: 401 });
+	}
+
+	const body = (await request.json()) as { repo?: string; branch?: string };
+	if (!body.repo) {
+		return Response.json({ error: "missing repo field" }, { status: 400 });
+	}
+
+	const repo = body.repo;
+	const branch = body.branch || "main";
+	const [owner] = repo.split("/");
+	if (!owner) {
+		return Response.json({ error: "invalid repo format, expected owner/name" }, { status: 400 });
+	}
+
+	// Trigger via GitHub App installation token
+	try {
+		const jwt = await createAppJWT(env);
+		const instRes = await fetch(`https://api.github.com/repos/${repo}/installation`, {
+			headers: { Authorization: `Bearer ${jwt}`, "User-Agent": "VibeCodeQA-App", Accept: "application/vnd.github+json" },
+		});
+		if (!instRes.ok) {
+			return Response.json({ error: "GitHub App not installed on this repo" }, { status: 404 });
+		}
+		const installation = (await instRes.json()) as { id: number };
+		const token = await getInstallationToken(installation.id, env);
+		if (!token) {
+			return Response.json({ error: "failed to get installation token" }, { status: 500 });
+		}
+
+		const dispatchRes = await fetch(`https://api.github.com/repos/${repo}/actions/workflows/vibecodeqa.yml/dispatches`, {
+			method: "POST",
+			headers: {
+				Authorization: `Bearer ${token}`,
+				"User-Agent": "VibeCodeQA-App",
+				Accept: "application/vnd.github+json",
+				"Content-Type": "application/json",
+			},
+			body: JSON.stringify({ ref: branch }),
+		});
+
+		if (!dispatchRes.ok) {
+			const text = await dispatchRes.text();
+			return Response.json({ error: "failed to trigger workflow", details: text }, { status: dispatchRes.status });
+		}
+
+		return Response.json({
+			ok: true,
+			repo,
+			branch,
+			status: "queued",
+			message: "Scan triggered via GitHub Actions workflow_dispatch",
+		});
+	} catch (err) {
+		return Response.json({ error: "scan trigger failed", details: String(err) }, { status: 500 });
+	}
+}
+
+/** Generate shields.io-style badge SVG */
+function buildBadgeSvg(score: number, grade: string): string {
+	const color = score >= 90 ? "#22c55e" : score >= 75 ? "#eab308" : score >= 60 ? "#f97316" : "#ef4444";
+	const label = "vcqa";
+	const value = `${grade} ${score}/100`;
+	const labelWidth = label.length * 7 + 10;
+	const valueWidth = value.length * 7 + 10;
+	const totalWidth = labelWidth + valueWidth;
+
+	return `<svg xmlns="http://www.w3.org/2000/svg" width="${totalWidth}" height="20" role="img">
+<linearGradient id="s" x2="0" y2="100%"><stop offset="0" stop-color="#bbb" stop-opacity=".1"/><stop offset="1" stop-opacity=".1"/></linearGradient>
+<clipPath id="r"><rect width="${totalWidth}" height="20" rx="3" fill="#fff"/></clipPath>
+<g clip-path="url(#r)">
+<rect width="${labelWidth}" height="20" fill="#555"/>
+<rect x="${labelWidth}" width="${valueWidth}" height="20" fill="${color}"/>
+<rect width="${totalWidth}" height="20" fill="url(#s)"/>
+</g>
+<g fill="#fff" text-anchor="middle" font-family="Verdana,Geneva,DejaVu Sans,sans-serif" font-size="11">
+<text x="${labelWidth / 2}" y="15" fill="#010101" fill-opacity=".3">${label}</text>
+<text x="${labelWidth / 2}" y="14">${label}</text>
+<text x="${labelWidth + valueWidth / 2}" y="15" fill="#010101" fill-opacity=".3">${value}</text>
+<text x="${labelWidth + valueWidth / 2}" y="14">${value}</text>
+</g>
+</svg>`;
 }
 
 async function triggerWorkflowDispatch(owner: string, repo: string, env: Env): Promise<void> {
