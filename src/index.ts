@@ -85,6 +85,8 @@ export default {
 				response = await handleTestNotification(request);
 			} else if (path === "/api/pro/doc-coherence" && request.method === "POST") {
 				response = await handleProDocCoherence(request, env);
+			} else if (path === "/api/pro/comment-staleness" && request.method === "POST") {
+				response = await handleProCommentStaleness(request, env);
 			} else if (path === "/api/reports" && request.method === "POST") {
 				response = await handleReportUpload(request, env);
 			} else if (path.startsWith("/api/reports/") && path.endsWith("/full") && request.method === "GET") {
@@ -747,6 +749,55 @@ function buildBadgeSvg(score: number, grade: string): string {
 <text x="${labelWidth + valueWidth / 2}" y="14">${value}</text>
 </g>
 </svg>`;
+}
+
+// ── POST /api/pro/comment-staleness — LLM-powered comment analysis ──
+
+async function handleProCommentStaleness(request: Request, env: Env): Promise<Response> {
+	const token = getToken(request);
+	if (!token) return Response.json({ error: "unauthorized" }, { status: 401 });
+	if (!env.ANTHROPIC_API_KEY) return Response.json({ error: "LLM not configured" }, { status: 503 });
+
+	const body = (await request.json()) as { pairs?: { file: string; line: number; comment: string; code: string }[] };
+	if (!body.pairs?.length) return Response.json({ findings: [] });
+	if (body.pairs.length > 15) return Response.json({ error: "too many pairs (max 15)" }, { status: 400 });
+
+	const pairText = body.pairs
+		.map((p, i) => `<pair_${i}>\n<file>${p.file}:${p.line}</file>\n<comment>${p.comment.slice(0, 300)}</comment>\n<code>${p.code.slice(0, 500)}</code>\n</pair_${i}>`)
+		.join("\n\n");
+
+	const prompt = `You are a code quality auditor. Analyze each comment+code pair in the <user_content> tags below. For each pair, determine if the comment accurately describes what the code does.
+
+Flag ONLY clear mismatches — not style preferences. Return a JSON array of findings. Each finding has: file (string), line (number), message (what's wrong), severity ("warning" for clear mismatch, "info" for potentially stale). If all comments match their code, return []. JSON array only, no markdown.
+
+<user_content>
+${pairText}
+</user_content>`;
+
+	try {
+		const res = await fetch("https://api.anthropic.com/v1/messages", {
+			method: "POST",
+			headers: {
+				"Content-Type": "application/json",
+				"x-api-key": env.ANTHROPIC_API_KEY,
+				"anthropic-version": "2023-06-01",
+			},
+			body: JSON.stringify({
+				model: "claude-haiku-4-5-20251001",
+				max_tokens: 1024,
+				messages: [{ role: "user", content: prompt }],
+			}),
+		});
+
+		if (!res.ok) return Response.json({ findings: [], error: "LLM request failed" });
+
+		const data = (await res.json()) as { content: { text: string }[] };
+		const text = data.content?.[0]?.text || "[]";
+		const findings = JSON.parse(text);
+		return Response.json({ findings: Array.isArray(findings) ? findings : [] });
+	} catch {
+		return Response.json({ findings: [] });
+	}
 }
 
 async function triggerWorkflowDispatch(owner: string, repo: string, env: Env): Promise<void> {
