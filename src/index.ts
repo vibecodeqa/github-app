@@ -87,6 +87,8 @@ export default {
 				response = await handleProDocCoherence(request, env);
 			} else if (path === "/api/pro/comment-staleness" && request.method === "POST") {
 				response = await handleProCommentStaleness(request, env);
+			} else if (path === "/api/pro/dead-patterns" && request.method === "POST") {
+				response = await handleProDeadPatterns(request, env);
 			} else if (path === "/api/reports" && request.method === "POST") {
 				response = await handleReportUpload(request, env);
 			} else if (path.startsWith("/api/reports/") && path.endsWith("/full") && request.method === "GET") {
@@ -797,6 +799,86 @@ ${pairText}
 		return Response.json({ findings: Array.isArray(findings) ? findings : [] });
 	} catch {
 		return Response.json({ findings: [] });
+	}
+}
+
+// ── POST /api/pro/dead-patterns — LLM-powered dead pattern detection ──
+
+async function handleProDeadPatterns(request: Request, env: Env): Promise<Response> {
+	const token = getToken(request);
+	if (!token) return Response.json({ error: "unauthorized" }, { status: 401 });
+	if (!env.ANTHROPIC_API_KEY) return Response.json({ error: "LLM not configured" }, { status: 503 });
+
+	const body = (await request.json()) as { cluster?: string; files?: { path: string; content: string }[] };
+	if (!body.files?.length) return Response.json({ findings: [] });
+	if (body.files.length > 50) return Response.json({ error: "too many files (max 50)" }, { status: 400 });
+
+	const totalChars = body.files.reduce((s, f) => s + (f.content?.length || 0), 0);
+	if (totalChars > 100_000) return Response.json({ error: "payload too large (max 100KB)" }, { status: 400 });
+
+	const codePayload = body.files
+		.map((f) => `<file path="${f.path}">\n${(f.content || "").slice(0, 5000)}\n</file>`)
+		.join("\n\n");
+
+	const prompt = `You are a code quality auditor specializing in detecting "vibe coding debt" — patterns left behind when AI-assisted refactoring introduces new implementations but leaves old code around.
+
+Analyze the source code files below from the "${body.cluster || "unknown"}" directory. Do two things:
+
+FIRST: Identify what feature or responsibility this code cluster implements. Give it a short human-readable label (2-4 words) and a one-sentence description.
+
+SECOND: Find these dead patterns:
+1. FALLBACK CODE: try/catch blocks that fall back to an old implementation. OR-chains that try new then fall back to old.
+2. PARALLEL IMPLEMENTATIONS: Two functions/classes doing the same thing — old + new coexisting.
+3. DEAD DEFENSIVE CODE: Guards or validations for states that can't occur given the rest of the code.
+4. ORPHANED ABSTRACTIONS: Interfaces with only one implementor (others were removed).
+5. HARDCODED FEATURE FLAGS: Boolean constants that always evaluate the same way, with dead branches.
+6. REDUNDANT WRAPPERS: Functions that just call through to another function with no added logic.
+
+Be conservative — only flag patterns clearly leftover from a refactor, not intentional defensive coding.
+
+Return a JSON object with this exact shape:
+{
+  "label": "Feature Name",
+  "description": "One sentence describing what this code does",
+  "findings": [
+    { "severity": "warning" or "info", "message": "what and why", "file": "path", "line": number, "rule": "fallback-code" | "parallel-impl" | "dead-guard" | "orphaned-abstraction" | "hardcoded-flag" | "redundant-wrapper" }
+  ]
+}
+
+If no dead patterns, set findings to []. JSON object only, no markdown.
+
+<user_content>
+${codePayload}
+</user_content>`;
+
+	try {
+		const res = await fetch("https://api.anthropic.com/v1/messages", {
+			method: "POST",
+			headers: {
+				"Content-Type": "application/json",
+				"x-api-key": env.ANTHROPIC_API_KEY,
+				"anthropic-version": "2023-06-01",
+			},
+			body: JSON.stringify({
+				model: "claude-haiku-4-5-20251001",
+				max_tokens: 2048,
+				messages: [{ role: "user", content: prompt }],
+			}),
+		});
+
+		if (!res.ok) return Response.json({ label: "", description: "", findings: [], error: "LLM request failed" });
+
+		const data = (await res.json()) as { content: { text: string }[] };
+		const text = data.content?.[0]?.text || "{}";
+		const jsonStr = text.replace(/^```json?\s*/, "").replace(/\s*```$/, "").trim();
+		const parsed = JSON.parse(jsonStr);
+		return Response.json({
+			label: parsed.label || "",
+			description: parsed.description || "",
+			findings: Array.isArray(parsed.findings) ? parsed.findings : [],
+		});
+	} catch {
+		return Response.json({ label: "", description: "", findings: [] });
 	}
 }
 
