@@ -89,6 +89,8 @@ export default {
 				response = await handleProCommentStaleness(request, env);
 			} else if (path === "/api/pro/dead-patterns" && request.method === "POST") {
 				response = await handleProDeadPatterns(request, env);
+			} else if (path === "/api/pro/test-audit" && request.method === "POST") {
+				response = await handleProTestAudit(request, env);
 			} else if (path === "/api/reports" && request.method === "POST") {
 				response = await handleReportUpload(request, env);
 			} else if (path.startsWith("/api/reports/") && path.endsWith("/full") && request.method === "GET") {
@@ -879,6 +881,64 @@ ${codePayload}
 		});
 	} catch {
 		return Response.json({ label: "", description: "", findings: [] });
+	}
+}
+
+// ── POST /api/pro/test-audit — LLM-powered test quality analysis ──
+
+async function handleProTestAudit(request: Request, env: Env): Promise<Response> {
+	const token = getToken(request);
+	if (!token) return Response.json({ error: "unauthorized" }, { status: 401 });
+	if (!env.ANTHROPIC_API_KEY) return Response.json({ error: "LLM not configured" }, { status: 503 });
+
+	const body = (await request.json()) as { file?: string; content?: string };
+	if (!body.content) return Response.json({ findings: [] });
+	if ((body.content?.length || 0) > 20_000) return Response.json({ error: "file too large (max 20KB)" }, { status: 400 });
+
+	const prompt = `You are a test quality auditor. Analyze the test file below and find tests that are fake, shallow, or misleading — the kind AI agents generate to inflate coverage without actually verifying behavior.
+
+Find these patterns:
+1. MISLEADING NAME: Test description says "should validate X" but assertions only check existence, not validation logic.
+2. IMPLEMENTATION TESTING: Tests that assert on internal implementation details (private methods, internal state) rather than observable behavior. Brittle to refactoring.
+3. MOCK ABUSE: Tests that mock the thing being tested, so they test the mock setup, not real code. Or tests where mocks return the expected value and the assertion just checks what the mock returns.
+4. COPY-PASTE TESTS: Multiple tests with identical structure/assertions but different names — suggests auto-generated padding.
+5. ASSERTION MISMATCH: The test calls some function but asserts on something unrelated.
+6. SNAPSHOT THEATER: Snapshot tests on trivial values (numbers, short strings) where a direct assertion would be clearer and more meaningful.
+
+Be conservative. Only flag tests that are clearly fake or misleading. Good defensive tests and edge case tests are fine even if they seem simple.
+
+Return a JSON array of findings. Each: { "severity": "warning" or "info", "message": "what's wrong", "file": "${body.file || "test"}", "line": approximate line number, "rule": "misleading-name" | "implementation-testing" | "mock-abuse" | "copy-paste-test" | "assertion-mismatch" | "snapshot-theater" }
+
+If all tests are genuine, return []. JSON array only, no markdown.
+
+<user_content>
+<file path="${body.file || "test"}">${(body.content || "").slice(0, 8000)}</file>
+</user_content>`;
+
+	try {
+		const res = await fetch("https://api.anthropic.com/v1/messages", {
+			method: "POST",
+			headers: {
+				"Content-Type": "application/json",
+				"x-api-key": env.ANTHROPIC_API_KEY,
+				"anthropic-version": "2023-06-01",
+			},
+			body: JSON.stringify({
+				model: "claude-haiku-4-5-20251001",
+				max_tokens: 2048,
+				messages: [{ role: "user", content: prompt }],
+			}),
+		});
+
+		if (!res.ok) return Response.json({ findings: [], error: "LLM request failed" });
+
+		const data = (await res.json()) as { content: { text: string }[] };
+		const text = data.content?.[0]?.text || "[]";
+		const jsonStr = text.replace(/^```json?\s*/, "").replace(/\s*```$/, "").trim();
+		const findings = JSON.parse(jsonStr);
+		return Response.json({ findings: Array.isArray(findings) ? findings : [] });
+	} catch {
+		return Response.json({ findings: [] });
 	}
 }
 
